@@ -1,0 +1,1022 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>IndexMem++ · The Gating Mechanism of KV Cache Eviction</title>
+<meta name="description" content="Train a KV-cache eviction gate on the model's own loss and it learns to evict nothing. One softmax normalizer explains why, and gives the fix. Qwen3-8B with 75% of KV evicted: RULER 8K 90.14 vs 93.86 for the full cache.">
+<link rel="canonical" href="https://xintongyang1010.github.io/IndexMem-The-Gating-Mechanism-of-KV-Cache-Eviction/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="IndexMem++">
+<meta property="og:title" content="The Gating Mechanism of KV Cache Eviction">
+<meta property="og:description" content="Train a KV-cache eviction gate on the model's own loss and it learns to evict nothing. One softmax normalizer explains why, and gives the fix. Qwen3-8B, 75% of KV evicted: RULER 8K 90.14 vs 93.86.">
+<meta property="og:url" content="https://xintongyang1010.github.io/IndexMem-The-Gating-Mechanism-of-KV-Cache-Eviction/">
+<meta property="og:image" content="https://xintongyang1010.github.io/IndexMem-The-Gating-Mechanism-of-KV-Cache-Eviction/assets/og.png">
+<meta property="og:image:width" content="2400">
+<meta property="og:image:height" content="1260">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="The Gating Mechanism of KV Cache Eviction">
+<meta name="twitter:description" content="Train a KV-cache eviction gate on the model's own loss and it learns to evict nothing. One softmax normalizer explains why, and gives the fix.">
+<meta name="twitter:image" content="https://xintongyang1010.github.io/IndexMem-The-Gating-Mechanism-of-KV-Cache-Eviction/assets/og.png">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232D52CC'/%3E%3Crect x='7' y='14.5' width='18' height='2.5' fill='white'/%3E%3Crect x='9' y='19' width='14' height='6' rx='1.5' fill='white' opacity='.85'/%3E%3Crect x='11' y='7' width='10' height='5' rx='1.5' fill='white' opacity='.5'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400..600;1,6..72,400;1,6..72,500&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: a paper page built around the softmax denominator; each section follows one consequence of it. */
+:root{
+  --bg:#F5F6F8; --surface:#FFFFFF; --ink:#151922; --ink-2:#424958; --muted:#687083; --rule:#DADEE6; --track:#ECEEF2;
+  --gate:#2D52CC; --gate-ink:#2846B0; --gate-soft:#E4EAFB; --centroid:#B8327F; --centroid-ink:#9E2A6D; --centroid-soft:#F8E6F0;
+  --kept:#2B3140; --neutral-bar:#7F889B; --slot:#9AA3B5; --slot-empty:#C8CDD7;
+  --f-display:"Newsreader", Georgia, "Times New Roman", serif;
+  --f-body:"IBM Plex Sans", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --f-mono:"IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --col:700px; --wide:1000px;
+  color-scheme:light;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#0E1016; --surface:#161922; --ink:#E7E9EF; --ink-2:#BAC0CC; --muted:#8C93A4; --rule:#2A2F3B; --track:#21252F;
+    --gate:#6A86E6; --gate-ink:#9DB2FF; --gate-soft:#1D2540; --centroid:#D45BA2; --centroid-ink:#F08DC8; --centroid-soft:#3A1E31;
+    --kept:#C9CEDA; --neutral-bar:#5D6578; --slot:#5D6578; --slot-empty:#363C4A;
+    color-scheme:dark;
+  }
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{
+  margin:0; background:var(--bg); color:var(--ink); font-family:var(--f-body); font-size:17px; line-height:1.62;
+  padding-left:max(16px, env(safe-area-inset-left, 0px)); padding-right:max(16px, env(safe-area-inset-right, 0px));
+  padding-block:0 64px; -webkit-font-smoothing:antialiased;
+}
+img{max-width:100%}
+a{color:var(--gate-ink); text-underline-offset:3px; text-decoration-thickness:1px}
+a:focus-visible, button:focus-visible, input:focus-visible, summary:focus-visible{outline:2px solid var(--gate); outline-offset:3px; border-radius:4px}
+.col{max-width:var(--col); margin-inline:auto}
+.wide{max-width:var(--wide); margin-inline:auto}
+h1,h2,h3{font-family:var(--f-display); font-weight:500; text-wrap:balance; margin:0; color:var(--ink)}
+h2{font-size:clamp(27px, 4.2vw, 36px); line-height:1.14; letter-spacing:-0.012em; font-style:italic}
+h3{font-size:21px; line-height:1.25}
+p{margin:0}
+.prose{display:flex; flex-direction:column; gap:18px}
+.prose p{color:var(--ink-2)}
+.prose strong{color:var(--ink); font-weight:600}
+.eyebrow{font-family:var(--f-mono); font-size:12px; letter-spacing:.08em; text-transform:uppercase; color:var(--muted)}
+.mono{font-family:var(--f-mono)}
+.num{font-variant-numeric:tabular-nums}
+i.v{font-family:var(--f-display); font-style:italic; font-size:1.06em}
+sub,sup{line-height:0}
+
+/* ---------- top bar ---------- */
+.topbar{position:sticky; top:0; z-index:5; background:color-mix(in srgb, var(--bg) 88%, transparent); backdrop-filter:blur(10px); border-bottom:1px solid var(--rule); margin-inline:calc(-1 * max(16px, env(safe-area-inset-left, 0px))) calc(-1 * max(16px, env(safe-area-inset-right, 0px))); padding-inline:max(16px, env(safe-area-inset-left, 0px)) max(16px, env(safe-area-inset-right, 0px))}
+.topbar .in{max-width:var(--wide); margin-inline:auto; display:flex; align-items:center; justify-content:space-between; gap:16px; height:48px}
+.topbar .brand{font-family:var(--f-mono); font-size:13px; letter-spacing:.06em; color:var(--ink); text-decoration:none; white-space:nowrap}
+.topbar nav{display:flex; gap:18px; overflow-x:auto; font-size:13.5px}
+.topbar nav a{color:var(--ink-2); text-decoration:none; white-space:nowrap}
+.topbar nav a:hover{color:var(--gate-ink)}
+
+/* ---------- hero ---------- */
+header.hero{padding-top:48px; display:flex; flex-direction:column; gap:22px}
+.hero h1{font-size:clamp(38px, 7vw, 64px); line-height:1.02; letter-spacing:-0.022em; font-weight:500}
+.hero h1 em{font-style:italic; color:var(--gate-ink)}
+.authors{font-size:15.5px; line-height:1.7; color:var(--ink-2)}
+.authors b{font-weight:500; color:var(--ink)}
+.affil{font-size:13.5px; color:var(--muted); line-height:1.6}
+.links{display:flex; flex-wrap:wrap; gap:10px}
+.chip{display:inline-flex; align-items:center; gap:8px; padding:8px 14px; border:1px solid var(--rule); border-radius:999px;
+  background:var(--surface); color:var(--ink); text-decoration:none; font-size:14px; font-weight:500; line-height:1.2}
+.chip:hover{border-color:var(--gate)}
+.chip .k{font-family:var(--f-mono); font-size:11.5px; color:var(--muted); letter-spacing:.04em; text-transform:uppercase}
+.lede{font-family:var(--f-display); font-size:clamp(20px, 2.6vw, 23px); line-height:1.5; color:var(--ink)}
+.lede em{font-style:italic}
+.tagline{font-size:15.5px; color:var(--ink-2); border-left:2px solid var(--gate); padding-left:14px; line-height:1.5}
+
+/* the denominator figure */
+.eqfig{background:var(--surface); border:1px solid var(--rule); border-radius:14px; padding:32px 28px 26px; display:flex; flex-direction:column; gap:26px}
+.eqrow{display:flex; align-items:center; justify-content:center; gap:18px; font-family:var(--f-display); color:var(--ink); overflow-x:auto; padding-bottom:4px}
+.eqrow .lhs{font-size:clamp(26px, 4.6vw, 40px); white-space:nowrap}
+.ratio{display:inline-flex; flex-direction:column; align-items:center; gap:6px; font-size:clamp(24px, 4.2vw, 38px); white-space:nowrap}
+.ratio .bar{align-self:stretch; height:2px; background:var(--ink)}
+.ratio .den{position:relative; padding:4px 14px 10px; border-radius:8px; background:var(--gate-soft); color:var(--ink)}
+.ratio .den::after{content:""; position:absolute; left:14px; right:14px; bottom:4px; height:3px; border-radius:2px; background:var(--gate)}
+.ratio .lg{color:var(--gate-ink)}
+.notes{display:grid; grid-template-columns:repeat(3, minmax(0,1fr)); gap:18px; border-top:2px solid var(--gate); padding-top:16px; position:relative}
+.notes::before{content:""; position:absolute; left:50%; top:-24px; height:22px; border-left:2px solid var(--gate)}
+.note{display:flex; flex-direction:column; gap:6px; min-width:0; text-decoration:none; color:inherit}
+.note .n{font-family:var(--f-mono); font-size:12px; color:var(--gate-ink); letter-spacing:.06em; text-transform:uppercase}
+.note b{font-family:var(--f-display); font-weight:500; font-size:19px; line-height:1.25; color:var(--ink)}
+.note span{font-size:14.5px; color:var(--ink-2); line-height:1.5}
+.note:hover b{color:var(--gate-ink)}
+.note.c .n{color:var(--centroid-ink)}
+@media (max-width:720px){ .notes{grid-template-columns:1fr} .notes::before{display:none} }
+
+.headline{display:grid; grid-template-columns:repeat(3, minmax(0,1fr)); gap:1px; background:var(--rule); border:1px solid var(--rule); border-radius:10px; overflow:hidden}
+.headline > div{background:var(--surface); padding:16px 18px; display:flex; flex-direction:column; gap:4px; min-width:0}
+.headline .big{font-family:var(--f-display); font-size:34px; line-height:1; font-variant-numeric:tabular-nums; color:var(--ink)}
+.headline .big small{font-size:17px; color:var(--muted); font-family:var(--f-body)}
+.headline .lab{font-size:13.5px; color:var(--ink-2); line-height:1.4}
+@media (max-width:640px){ .headline{grid-template-columns:1fr} }
+
+/* ---------- sections ---------- */
+section{padding-top:76px; display:flex; flex-direction:column; gap:22px; scroll-margin-top:64px}
+.sec-head{display:flex; flex-direction:column; gap:10px}
+.qtag{display:flex; align-items:center; gap:10px}
+.qtag .q{font-family:var(--f-mono); font-size:12px; letter-spacing:.06em; color:var(--surface); background:var(--ink); border-radius:4px; padding:2px 7px}
+figure{margin:0}
+.fig{background:var(--surface); border:1px solid var(--rule); border-radius:12px; padding:22px; display:flex; flex-direction:column; gap:16px}
+figcaption, .cap{font-size:13.5px; color:var(--muted); line-height:1.55}
+.eq{font-family:var(--f-display); font-size:21px; text-align:center; padding:6px 0; color:var(--ink); overflow-x:auto; white-space:nowrap}
+math{font-family:"STIX Two Math", "Cambria Math", "Latin Modern Math", var(--f-display), serif; font-size:1.05em; color:var(--ink)}
+.eq math{font-size:22px}
+.eq.two{display:flex; flex-direction:column; gap:10px; align-items:center}
+math .tx{font-family:var(--f-body); font-size:.78em}
+.aside{border-left:2px solid var(--centroid); padding:4px 0 4px 16px; font-family:var(--f-display); font-style:italic; font-size:20px; line-height:1.45; color:var(--ink)}
+.statrow{display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:14px}
+.stat{background:var(--surface); border:1px solid var(--rule); border-radius:10px; padding:16px 18px; display:flex; flex-direction:column; gap:4px; min-width:0}
+.stat .big{font-family:var(--f-mono); font-size:34px; line-height:1; color:var(--ink); font-variant-numeric:tabular-nums}
+.stat .big.hot{color:var(--gate-ink)}
+.stat .lab{font-size:13.5px; color:var(--ink-2); line-height:1.4}
+
+/* keys */
+.key{display:flex; flex-direction:column; gap:18px; padding-top:34px; border-top:1px solid var(--rule); scroll-margin-top:64px}
+.key:first-of-type{border-top:0; padding-top:10px}
+.key .kn{display:inline-flex; align-items:center; gap:10px; font-family:var(--f-mono); font-size:12px; letter-spacing:.08em; text-transform:uppercase; color:var(--gate-ink)}
+.key .kn i{display:inline-flex; align-items:center; justify-content:center; width:24px; height:24px; border-radius:50%; background:var(--gate); color:#fff; font-style:normal; font-size:12px}
+.key h3{font-size:24px; font-style:italic; font-weight:500}
+details{border:1px solid var(--rule); border-radius:10px; background:var(--surface)}
+details summary{cursor:pointer; padding:12px 16px; font-size:14px; color:var(--ink-2); list-style:none; display:flex; align-items:center; gap:10px}
+details summary::-webkit-details-marker{display:none}
+details summary::before{content:"+"; font-family:var(--f-mono); color:var(--gate-ink); width:1em}
+details[open] summary::before{content:"−"}
+details .body{padding:4px 16px 18px; display:flex; flex-direction:column; gap:22px}
+details .body h4{margin:0; font-size:14px; font-weight:600; color:var(--ink)}
+
+/* ---------- demo ---------- */
+.demo-controls{display:flex; flex-wrap:wrap; gap:12px 22px; align-items:center}
+.seg{display:inline-flex; border:1px solid var(--rule); border-radius:8px; overflow:hidden}
+.seg button{font:inherit; font-size:14px; padding:7px 14px; border:0; background:var(--surface); color:var(--ink-2); cursor:pointer}
+.seg button[aria-pressed="true"]{background:var(--ink); color:var(--bg)}
+.toggle{display:inline-flex; align-items:center; gap:9px; font-size:14px; color:var(--ink-2); cursor:pointer; user-select:none}
+.toggle input{appearance:none; width:34px; height:20px; border-radius:999px; background:var(--track); border:1px solid var(--rule); position:relative; cursor:pointer; margin:0; flex:0 0 auto; transition:background .2s}
+.toggle input::after{content:""; position:absolute; top:2px; left:2px; width:14px; height:14px; border-radius:50%; background:var(--muted); transition:transform .2s, background .2s}
+.toggle input:checked{background:var(--gate)}
+.toggle input:checked::after{transform:translateX(14px); background:#fff}
+.slider{display:flex; align-items:center; gap:10px; font-size:14px; color:var(--ink-2); min-width:0}
+.slider input{accent-color:var(--gate); width:150px; max-width:40vw}
+.slider output{font-family:var(--f-mono); font-size:13px; color:var(--ink); min-width:3.2em}
+.slider.off{opacity:.4}
+.plot{position:relative; display:flex; align-items:flex-end; gap:4px; height:200px; padding-top:6px; border-bottom:1px solid var(--rule)}
+.colm{flex:1 1 0; min-width:0; height:100%; position:relative; cursor:default}
+.colm .dense{position:absolute; left:0; right:0; bottom:0; border:1.5px dashed var(--muted); border-bottom:0; border-radius:3px 3px 0 0; opacity:.75}
+.colm .gated{position:absolute; left:18%; right:18%; bottom:0; background:var(--gate); border-radius:3px 3px 0 0; transition:height .25s ease}
+.colm.pin .gated{background:var(--kept)}
+.colm.capped .gated{border-top:3px double var(--surface)}
+.roles{display:flex; gap:4px}
+.roles div{flex:1 1 0; min-width:0; height:6px; border-radius:2px; background:var(--gate-soft)}
+.roles div.pin{background:var(--kept)}
+.scores{display:flex; gap:4px; height:26px; align-items:center}
+.scores div{flex:1 1 0; min-width:0; height:100%; border-radius:2px; background:var(--gate); transition:opacity .25s}
+.scores div.na{background:transparent; box-shadow:inset 0 0 0 1px var(--rule)}
+.rowlab{font-family:var(--f-mono); font-size:11.5px; color:var(--muted); letter-spacing:.03em}
+.readout{display:grid; grid-template-columns:repeat(3, minmax(0,1fr)); gap:14px}
+.readout > div{display:flex; flex-direction:column; gap:2px; min-width:0}
+.readout .val{font-family:var(--f-mono); font-size:20px; color:var(--ink); font-variant-numeric:tabular-nums}
+.verdict{font-size:15px; line-height:1.5; padding:12px 14px; border-radius:8px; background:var(--track); color:var(--ink)}
+.verdict.ok{background:var(--gate-soft)}
+.try{font-size:13.5px; color:var(--muted)}
+@media (max-width:640px){ .readout{grid-template-columns:1fr 1fr} .readout > div:last-child{grid-column:1 / -1} .plot{height:160px} .colm .gated{left:10%; right:10%} }
+
+/* ---------- diagrams ---------- */
+.scrollx{overflow-x:auto; max-width:100%}
+.scrollx .diagram{min-width:600px}
+.diagram{width:100%; height:auto; display:block}
+.diagram text{font-family:var(--f-body); fill:var(--ink-2)}
+.diagram .mono{font-family:var(--f-mono)}
+.diagram .serif{font-family:var(--f-display); font-style:italic; fill:var(--ink)}
+.diagram .lab{font-size:11.5px; fill:var(--muted)}
+.diagram .ttl{font-size:13px; font-weight:600; fill:var(--ink)}
+.hb{display:grid; grid-template-columns:repeat(4, minmax(0,1fr)); gap:10px}
+.hb > div{display:flex; flex-direction:column; gap:3px; min-width:0; padding:10px 12px; border-radius:8px; background:var(--track)}
+.hb .hn{font-size:12.5px; color:var(--muted)}
+.hb .hv{font-family:var(--f-mono); font-size:18px; color:var(--ink); font-variant-numeric:tabular-nums}
+.hb .hv small{font-size:12px; color:var(--muted); font-family:var(--f-body)}
+.hb .hm{font-size:12.5px; color:var(--ink-2)}
+@media (max-width:560px){ .hb{grid-template-columns:repeat(2, minmax(0,1fr))} }
+.kp{display:grid; grid-template-columns:repeat(4, minmax(0,1fr)); gap:10px}
+.kp > div{display:flex; flex-direction:column; gap:3px; min-width:0; padding:12px 14px; border-radius:8px; background:var(--track)}
+.kp .kv{font-family:var(--f-mono); font-size:19px; color:var(--ink); font-variant-numeric:tabular-nums; line-height:1.2}
+.kp .kv small{font-size:12px; color:var(--muted); font-family:var(--f-body)}
+.kp .kl{font-size:12.5px; color:var(--ink-2); line-height:1.4}
+@media (max-width:720px){ .kp{grid-template-columns:repeat(2, minmax(0,1fr))} }
+.steps{display:grid; grid-template-columns:repeat(3, minmax(0,1fr)); gap:14px}
+.steps > div{display:flex; flex-direction:column; gap:4px; min-width:0}
+.steps .sn{font-family:var(--f-mono); font-size:11.5px; letter-spacing:.06em; text-transform:uppercase; color:var(--centroid-ink)}
+.steps p{font-size:14px; color:var(--ink-2); line-height:1.5}
+@media (max-width:640px){ .steps{grid-template-columns:1fr} }
+
+/* ---------- bar charts ---------- */
+.bars{display:flex; flex-direction:column; gap:10px}
+.brow{display:grid; grid-template-columns:minmax(0, 13.5em) minmax(0,1fr) auto; gap:12px; align-items:center}
+.brow .bl{font-size:14px; color:var(--ink-2); line-height:1.3; min-width:0}
+.brow .bl small{display:block; font-size:12px; color:var(--muted)}
+.brow.hi .bl{color:var(--ink); font-weight:600}
+.track{position:relative; height:20px}
+.fill{position:absolute; left:0; top:0; bottom:0; border-radius:0 4px 4px 0; background:var(--neutral-bar)}
+.brow.hi .fill{background:var(--gate)}
+.refline{position:absolute; top:-6px; bottom:-6px; width:0; border-left:1.5px dashed var(--ink-2)}
+.bv{font-family:var(--f-mono); font-size:13.5px; text-align:right; font-variant-numeric:tabular-nums; color:var(--ink-2); min-width:3.6em}
+.brow.hi .bv{color:var(--ink); font-weight:500}
+.delta{font-family:var(--f-mono); font-size:11.5px; color:var(--gate-ink); margin-left:6px; white-space:nowrap}
+.reflab{font-size:12.5px; color:var(--muted); display:flex; gap:8px; align-items:center}
+.reflab i{display:inline-block; width:14px; border-top:1.5px dashed var(--ink-2)}
+@media (max-width:560px){ .brow{grid-template-columns:minmax(0,1fr) auto; gap:4px 10px} .brow .bl{grid-column:1 / -1} .brow .track{grid-column:1} }
+
+/* ---------- heat table ---------- */
+.heat-wrap{border:0; background:transparent}
+.heat{border-collapse:separate; border-spacing:3px; width:100%}
+.heat th{font-family:var(--f-mono); font-size:11.5px; font-weight:500; color:var(--muted); letter-spacing:.04em; text-transform:uppercase; padding:4px 8px; border:0; background:transparent; text-align:right}
+.heat th:first-child{text-align:left}
+.heat td{padding:7px 10px; border:0; border-radius:4px; font-family:var(--f-mono); font-size:13px; color:var(--ink); text-align:right}
+.heat td:first-child{font-family:var(--f-body); color:var(--ink-2); background:transparent; padding-left:0; text-align:left}
+.heat tr.hot td:first-child{color:var(--gate-ink); font-weight:600}
+.heat tr.avg td{font-weight:600; border-top:2px solid var(--rule); border-radius:0}
+.heat tr.avg td:first-child{color:var(--ink)}
+
+/* tooltip */
+#tip{position:fixed; z-index:20; pointer-events:none; background:var(--ink); color:var(--bg); font-size:12.5px; line-height:1.45; padding:7px 10px; border-radius:6px; max-width:250px; opacity:0; transition:opacity .12s}
+#tip.on{opacity:1}
+
+/* ---------- cards ---------- */
+.duo{display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:14px}
+.card{background:var(--surface); border:1px solid var(--rule); border-radius:10px; padding:18px; display:flex; flex-direction:column; gap:10px; min-width:0}
+.card h3{font-size:19px}
+.card p{font-size:15px; color:var(--ink-2); line-height:1.55}
+.card .stat{font-family:var(--f-mono); font-size:13px; color:var(--ink); background:var(--track); border:0; border-radius:6px; padding:8px 10px; line-height:1.5; display:block}
+@media (max-width:720px){ .duo{grid-template-columns:1fr} }
+.tiles{display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:14px}
+.tile{border-radius:10px; padding:16px 18px; display:flex; flex-direction:column; gap:6px; min-width:0; background:var(--track)}
+.tile.c{background:var(--centroid-soft)}
+.tile .lab{font-size:13.5px; color:var(--muted)}
+.tile.c .lab{color:var(--centroid-ink)}
+.tile .big{font-family:var(--f-mono); font-size:28px; line-height:1; color:var(--ink)}
+@media (max-width:520px){ .tiles{grid-template-columns:1fr} }
+
+/* ---------- tables ---------- */
+.tbl-wrap{overflow-x:auto; max-width:100%; border:1px solid var(--rule); border-radius:10px; background:var(--surface)}
+table{border-collapse:collapse; width:100%; font-size:14px; font-variant-numeric:tabular-nums}
+th,td{padding:9px 12px; text-align:right; white-space:nowrap; border-bottom:1px solid var(--rule)}
+th:first-child, td:first-child{text-align:left}
+thead th{font-family:var(--f-mono); font-size:11.5px; font-weight:500; color:var(--muted); letter-spacing:.04em; text-transform:uppercase; background:var(--bg)}
+thead tr.grp th{text-transform:none; font-size:12.5px; color:var(--ink-2); border-bottom:0}
+tbody tr:last-child td{border-bottom:0}
+tr.ours td{font-weight:600; color:var(--ink); background:var(--gate-soft)}
+tr.fullkv td{color:var(--muted)}
+td .len{display:block; font-size:11.5px; color:var(--muted); font-weight:400; font-family:var(--f-mono)}
+
+.callout{display:grid; grid-template-columns:auto minmax(0,1fr); gap:18px; align-items:center; padding:18px 20px; border-radius:10px; background:var(--gate-soft)}
+.callout .n{font-family:var(--f-display); font-size:46px; line-height:1; color:var(--gate-ink); font-variant-numeric:tabular-nums}
+.callout p{font-size:15px; color:var(--ink); line-height:1.5}
+@media (max-width:520px){ .callout{grid-template-columns:1fr} }
+
+/* ---------- summary ---------- */
+.facts{display:flex; flex-direction:column; border-top:1px solid var(--rule)}
+.facts > div{display:grid; grid-template-columns:18px minmax(0,1fr); gap:12px; padding:12px 0; border-bottom:1px solid var(--rule); font-size:15.5px; color:var(--ink); line-height:1.5}
+.facts > div > b{display:block; width:10px; height:10px; margin-top:8px; border-radius:2px; background:var(--gate)}
+.linkrows{display:flex; flex-direction:column; gap:8px; font-size:15px}
+.linkrows div{display:grid; grid-template-columns:7em minmax(0,1fr); gap:12px}
+.linkrows span{color:var(--muted)}
+.linkrows a{font-family:var(--f-mono); font-size:14px; word-break:break-all}
+
+pre.bib{margin:0; font-family:var(--f-mono); font-size:13px; line-height:1.6; color:var(--ink-2); background:var(--surface); border:1px solid var(--rule); border-radius:10px; padding:18px; overflow-x:auto}
+.copy{align-self:flex-start; font:inherit; font-size:13.5px; padding:7px 14px; border-radius:7px; border:1px solid var(--rule); background:var(--surface); color:var(--ink); cursor:pointer}
+.copy:hover{border-color:var(--gate)}
+footer{padding-top:64px; font-size:13.5px; color:var(--muted); display:flex; flex-direction:column; gap:6px}
+
+@media (prefers-reduced-motion: reduce){ *{transition:none !important} html{scroll-behavior:auto} }
+</style>
+</head>
+<body>
+
+<div id="tip" role="tooltip"></div>
+
+<div class="topbar"><div class="in">
+  <a class="brand" href="#top">IndexMem++</a>
+  <nav aria-label="Page sections">
+    <a href="#trap">Why it fails</a>
+    <a href="#keys">Three keys</a>
+    <a href="#results">Results</a>
+    <a href="#keeps">What it keeps</a>
+    <a href="#summary">Summary</a>
+    <a href="#bibtex">BibTeX</a>
+  </nav>
+</div></div>
+
+<header class="hero col" id="top">
+  <div class="eyebrow">IndexMem++ · arXiv 2611.07605</div>
+  <h1>The Gating Mechanism of <em>KV Cache Eviction</em></h1>
+  <div class="authors">
+    <b>Hao Gu</b><sup>1*</sup>, <b>Xintong Yang</b><sup>2*</sup>, Zhiwei Li<sup>3</sup>, Lei Zhu<sup>4</sup>, Jian Yang<sup>1</sup>, Qiyuan Zhu<sup>1</sup>, Dezhi Li<sup>1</sup>, Jingyuan Zhang<sup>5</sup>, Zhizhuo Kou<sup>1</sup>, Hao Wang<sup>6</sup>, Bei Liu<sup>1</sup>, Jiacheng Liu<sup>7</sup>, Sirui Han<sup>1†</sup>
+  </div>
+  <div class="affil"><sup>1</sup>HKUST · <sup>2</sup>New York University · <sup>3</sup>HKUST (Guangzhou) · <sup>4</sup>Tencent HunYuan · <sup>5</sup>Georgia Tech · <sup>6</sup>City University of Hong Kong · <sup>7</sup>Shanghai Jiao Tong University<br>*Equal contribution · †Corresponding author</div>
+  <nav class="links" aria-label="Paper links">
+    <a class="chip" href="https://arxiv.org/abs/2611.07605"><span class="k">Paper</span> arXiv</a>
+    <a class="chip" href="https://github.com/Chooovy/IndexMem"><span class="k">Code</span> GitHub</a>
+    <a class="chip" href="https://huggingface.co/marcusguhao/IndexMem-Qwen3-8B"><span class="k">Gate</span> Qwen3-8B</a>
+    <a class="chip" href="https://huggingface.co/marcusguhao/IndexMem-Qwen3-4B"><span class="k">Gate</span> Qwen3-4B</a>
+    <a class="chip" href="#bibtex"><span class="k">Cite</span> BibTeX</a>
+  </nav>
+
+  <p class="lede">Train a gate, on the model's own loss, to decide which KV entries the model can do without, and it learns to evict <em>nothing</em>. The reason sits in the denominator of the softmax. So does the fix.</p>
+  <p class="tagline">Learned KV eviction is not a capacity problem. It is an objective problem.</p>
+
+  <figure class="eqfig" aria-label="Gated attention with the softmax denominator highlighted, and three consequences of it">
+    <div class="eqrow">
+      <span class="lhs"><i>a</i><sub>ij</sub> =</span>
+      <span class="ratio">
+        <span>exp(<i>ℓ</i><sub>ij</sub> + <span class="lg">log <i>g</i><sub>j</sub></span>)</span>
+        <span class="bar"></span>
+        <span class="den">Σ<sub><i>m</i></sub> exp(<i>ℓ</i><sub>im</sub> + <span class="lg">log <i>g</i><sub>m</sub></span>)</span>
+      </span>
+    </div>
+    <div class="notes">
+      <a class="note" href="#trap"><span class="n">① Training</span><b>A constant gate cancels here.</b><span>Keeping everything costs nothing, and a frozen model's loss prefers it.</span></a>
+      <a class="note" href="#key2"><span class="n">② Across heads</span><b>So does a per-head shift.</b><span>Scores rank entries within a head. Retained attention mass, measured online, splits the budget.</span></a>
+      <a class="note c" href="#key3"><span class="n">③ Recovery</span><b>The evicted share lives here.</b><span><i class="v">ρ</i> = Z<sub>E</sub> / (Z<sub>S</sub> + Z<sub>E</sub>). Centroids of the evicted entries are read back inside the same softmax.</span></a>
+    </div>
+  </figure>
+
+  <div class="headline" role="list">
+    <div role="listitem"><span class="big num">90.14 <small>/ 93.86</small></span><span class="lab">RULER 8K, Qwen3-8B, 75% of KV evicted. Full-KV after the slash.</span></div>
+    <div role="listitem"><span class="big num">0.600 <small>/ 0.700</small></span><span class="lab">AIME25 pass@1 with a 2,048-entry cache per KV head.</span></div>
+    <div role="listitem"><span class="big num">46.03 <small>/ 47.39</small></span><span class="lab">LongBench, 15 tasks, 75% of KV evicted.</span></div>
+  </div>
+</header>
+
+<!-- 1 -->
+<section class="col" id="question">
+  <div class="sec-head">
+    <div class="qtag"><span class="q">1</span><span class="eyebrow">What eviction has to decide</span></div>
+    <h2>Not whether an entry will be used again, but whether the rest of the cache can still supply it</h2>
+  </div>
+  <div class="prose">
+    <p>Sparse attention selects the entries relevant to the current query and selects again at the next one. Eviction deletes: every later query loses the entry, and the question that will need it has not arrived yet. So eviction has to answer a different question: once this entry is gone, is its information still available elsewhere in the cache? Causal attention copies much of the past into later entries, which is why a sliding window sees beyond itself. An isolated fact, such as a password or a retrieval key, may live in one entry only.</p>
+    <p>Most eviction methods answer the first question with a proxy: SnapKV reads the attention of recent queries, KeyDiff asks whether a key is geometrically distinctive, TrimKV leans on token age. IndexMem++ scores each entry from its own hidden state, with no reference to a future query. The decision is made once, when an entry falls out of the budget, and the entry is physically deleted.</p>
+    <p>That score has no per-entry label to regress. The only supervision is the model's output, so the score enters attention as a gate inside the softmax, where lowering one entry hands its attention mass to the others, exactly as removing it would.</p>
+  </div>
+</section>
+
+<!-- 2 -->
+<section class="col" id="trap">
+  <div class="sec-head">
+    <div class="qtag"><span class="q">2</span><span class="eyebrow">Trained directly</span></div>
+    <h2>The gate is unusable, and it is not a tuning problem</h2>
+  </div>
+  <div class="statrow">
+    <div class="stat"><span class="big hot num">4.33</span><span class="lab">RULER 8K with 75% of KV evicted, gate trained on the LM loss</span></div>
+    <div class="stat"><span class="big num">70.01</span><span class="lab">The same model with nothing evicted (Qwen3-0.6B)</span></div>
+  </div>
+  <div class="prose">
+    <p>A small MLP reads a score <i class="v">s<sub>j</sub></i> = log <i class="v">g<sub>j</sub></i> off each entry's hidden state, and the backbone stays frozen. Trained on the language-modeling loss, the scores come out nearly constant. The loss falls the whole time, so optimization is not what failed. A constant added to every logit cancels in the denominator, so attention stays exactly dense, and a backbone fitted to dense attention has its lowest loss there. The top-<i class="v">B</i> cut then falls among near-ties and keeps an arbitrary set.</p>
+    <p>Existing learned-eviction mechanisms, the sparsity penalty in TrimKV and the relaxations of discrete decisions in DMC and DMS, work around this solution rather than remove it.</p>
+  </div>
+  <p class="aside">The no-op is not a floor the gate improves from. It is what the objective asks for.</p>
+
+  <figure class="fig" id="demo">
+    <p class="try">Try it: with constant scores, move <i class="v">c</i> and watch the KL stay at zero. Turn on both switches, then switch to trained scores and watch the gate start to rank.</p>
+    <div class="demo-controls">
+      <div class="seg" role="group" aria-label="Gate scores">
+        <button type="button" id="mConst" aria-pressed="true">Constant scores</button>
+        <button type="button" id="mTrain" aria-pressed="false">Trained scores</button>
+      </div>
+      <label class="slider" id="cWrap" for="cIn">shift <i class="v">c</i> <input type="range" id="cIn" min="-3" max="3" step="0.1" value="1.5"><output id="cOut">+1.5</output></label>
+    </div>
+    <div class="demo-controls">
+      <label class="toggle" for="tPin"><input type="checkbox" id="tPin">Never gate sink + local window</label>
+      <label class="toggle" for="tFix"><input type="checkbox" id="tFix">Evictable entries share a fixed mass <i class="v">β</i></label>
+      <label class="slider off" id="bWrap" for="bIn"><i class="v">β</i> <input type="range" id="bIn" min="1" max="15" step="1" value="2" disabled><output id="bOut">2</output></label>
+    </div>
+    <div>
+      <div class="plot" id="plot" aria-label="Attention over 20 cached entries: dense outline and gated fill"></div>
+      <div class="roles" id="roles" aria-hidden="true" style="margin-top:6px"></div>
+    </div>
+    <div style="display:flex; flex-direction:column; gap:6px">
+      <span class="rowlab">gate g<sub>j</sub> (darker = larger)</span>
+      <div class="scores" id="scores" aria-hidden="true"></div>
+    </div>
+    <div class="readout">
+      <div><span class="eyebrow">KL(dense ‖ gated)</span><span class="val" id="rKL">0.000</span></div>
+      <div><span class="eyebrow">Score spread</span><span class="val" id="rSpread">0.00</span></div>
+      <div><span class="eyebrow">Can constant scores give dense?</span><span class="val" id="rReach" style="font-size:15px; font-family:var(--f-body)">Yes, at any c</span></div>
+    </div>
+    <div class="verdict" id="verdict" aria-live="polite"></div>
+    <figcaption>Toy example: one query over 20 cached entries. Dashed outlines are dense attention, filled bars the gated attention (dark bars are the never-gated entries). "Trained scores" runs gradient descent on KL to this query's dense attention, the optimum a frozen backbone's loss sits near.</figcaption>
+  </figure>
+</section>
+
+<!-- 3 -->
+<section class="col" id="keys">
+  <div class="sec-head">
+    <div class="qtag"><span class="q">3</span><span class="eyebrow">What makes it work</span></div>
+    <h2>Three things, all read off the same denominator</h2>
+  </div>
+  <p class="cap">Ablations in this section: Qwen3-0.6B, RULER 8K average, 75% of KV evicted, each arm trained for 100 steps. The dense model scores 70.01.</p>
+
+  <div class="key" id="key1">
+    <span class="kn"><i>1</i>Close the no-op, then change the teacher</span>
+    <h3>Make "keep everything" unreachable, then distill from the full-KV model</h3>
+    <div class="prose">
+      <p><strong>Pinned entries and a fixed mass.</strong> Every eviction policy keeps a few attention sinks and a local window anyway. Hold their gates at 1 and they become a reference frame. The remaining entries share a total gate mass <i class="v">β</i> far below their count, so constant scores can only scale all of them down together, by <i class="v">β</i>/|<i class="v">E</i>|, about 3% in the pilot. Dense attention is out of reach, and an entry has to outscore the others to stay. <i class="v">β</i> is also the exact sparsity during training; no penalty or schedule is needed.</p>
+      <p><strong>Distillation instead of next-token loss.</strong> The cross-entropy gradient on the output logits is the sum of two errors: the one eviction causes, and the one the frozen model already makes, which no gate can fix and which dominates at hard positions. Reweighting tokens scales both together. Distilling against the same model with full KV leaves only the first term.</p>
+    </div>
+    <div class="eq"><math display="block"><mrow><msup><mi>p</mi><mtext class="tx">gated</mtext></msup><mo>−</mo><msub><mi>e</mi><mi>y</mi></msub><mo>=</mo><mo>(</mo><msup><mi>p</mi><mtext class="tx">gated</mtext></msup><mo>−</mo><msup><mi>p</mi><mtext class="tx">dense</mtext></msup><mo>)</mo><mo>+</mo><mo>(</mo><msup><mi>p</mi><mtext class="tx">dense</mtext></msup><mo>−</mo><msub><mi>e</mi><mi>y</mi></msub><mo>)</mo></mrow></math></div>
+    <figure class="fig">
+      <div class="bars" id="stairs1"></div>
+      <div class="reflab"><i></i>Dense model, no eviction (70.01)</div>
+    </figure>
+    <details>
+      <summary>Ablation details: what to pin, and which loss</summary>
+      <div class="body">
+        <div>
+          <h4>Which entries are never gated (all arms use β = 256)</h4>
+          <div class="bars" id="pinChart" style="margin-top:10px"></div>
+          <p class="cap" style="margin-top:8px">Normalizing alone is one more constant per row, and the softmax absorbs it too.</p>
+        </div>
+        <div>
+          <h4>Training loss (full recipe otherwise)</h4>
+          <div class="bars" id="lossChart" style="margin-top:10px"></div>
+          <p class="cap" style="margin-top:8px">Neither KL direction contains the frozen model's own error; reverse KL was chosen empirically.</p>
+        </div>
+      </div>
+    </details>
+  </div>
+
+  <div class="key" id="key2">
+    <span class="kn"><i>2</i>Across heads</span>
+    <h3>Scores cannot be compared across heads, so retained attention mass splits the budget, online</h3>
+    <div class="prose">
+      <p>Adding a constant to every score of one head changes nothing inside that head, so the level of a head's scores is never trained, and ranking two heads' scores together means nothing. The split has to come from a quantity the shift does not move: the attention mass each head retains.</p>
+      <p>The allocation is computed once, at the end of prefill, from the attention this input actually produced. Each head orders its evictable entries by score and accumulates the mass retained as entries are added on top of the pinned sinks and window. A shared target <i class="v">ρ</i>* is found by bisection so that the per-head slot counts, each the smallest that reaches <i class="v">ρ</i>*, sum to the layer budget; a floor of <i class="v">K</i>/4 keeps any head from being starved. A head whose attention is spread across the context gets more slots, a head whose mass already sits on the sinks and window gets fewer. Nothing is fitted in advance, and decoding runs with these budgets held fixed.</p>
+    </div>
+    <figure class="fig" id="hbfig">
+      <div class="demo-controls">
+        <div class="seg" role="group" aria-label="Input">
+          <button type="button" id="hbA" aria-pressed="true">Input A</button>
+          <button type="button" id="hbB" aria-pressed="false">Input B</button>
+        </div>
+        <label class="slider" for="hbK">budget <i class="v">K</i> <input type="range" id="hbK" min="10" max="60" step="1" value="25"><output id="hbKOut">25%</output></label>
+      </div>
+      <div class="scrollx"><svg class="diagram" id="hbSvg" viewBox="0 0 680 270" role="img" aria-label="Retained attention mass of four heads as entries are kept in score order, with the shared target and each head's allocated slots"></svg></div>
+      <div class="hb" id="hbBars"></div>
+      <figcaption>Toy curves for one layer with four KV heads. Each curve is the attention mass a head retains as its entries are kept in score order; the starting value is the mass already on the pinned sinks and window. The dashed line is the shared target <i class="v">ρ</i>*, the dots are the allocated slots, and the faint vertical is the uniform split. Switch the input and the curves, and the allocation, change.</figcaption>
+    </figure>
+    <figure class="fig">
+      <div class="bars" id="headsChart"></div>
+      <figcaption>Shuffling the same budgets across heads scores below the uniform split: the gain comes from matching budgets to heads, not from unequal budgets. The offline table averages the online allocations over a calibration set and recovers part of the gain without reading the input.</figcaption>
+    </figure>
+  </div>
+
+  <div class="key" id="key3">
+    <span class="kn"><i>3</i>Recovery</span>
+    <h3>Evicted information comes back inside the same softmax: centroid memory (CMP)</h3>
+    <div class="prose">
+      <p>Eviction drops a share <i class="v">ρ</i> of the attention mass, about 0.2 in our measurements. With <i class="v">o<sub>S</sub></i> and <i class="v">o<sub>E</sub></i> the normalized outputs over the retained and evicted entries:</p>
+    </div>
+    <div class="eq"><math display="block"><mrow><msub><mi>o</mi><mtext class="tx">dense</mtext></msub><mo>=</mo><mrow><mo>(</mo><mn>1</mn><mo>−</mo><mi>ρ</mi><mo>)</mo></mrow><msub><mi>o</mi><mi>S</mi></msub><mo>+</mo><mi>ρ</mi><msub><mi>o</mi><mi>E</mi></msub><mo>,</mo><mspace width="1.2em"/><mi>ρ</mi><mo>=</mo><mfrac><msub><mi>Z</mi><mi>E</mi></msub><mrow><msub><mi>Z</mi><mi>S</mi></msub><mo>+</mo><msub><mi>Z</mi><mi>E</mi></msub></mrow></mfrac></mrow></math></div>
+    <div class="prose">
+      <p>Recovery needs both terms: the direction <i class="v">o<sub>E</sub></i>, which is the output the query would get from the evicted entries alone, and the share <i class="v">ρ</i>, a ratio of softmax normalizers. A memory read after attention falls short on both. Its reconstruction of <i class="v">o<sub>E</sub></i> is poor, and even an exact <i class="v">o<sub>E</sub></i> would still need the mixing weights 1 − <i class="v">ρ</i> and <i class="v">ρ</i>, which it never sees and has to learn indirectly in output space. IndexMem++ keeps the evicted entries inside the softmax instead, as a small set of centroids.</p>
+    </div>
+    <figure class="fig">
+      <div class="scrollx"><svg class="diagram" id="cmpSvg" viewBox="0 0 800 262" role="img" aria-label="Three steps: evicted entries, clustering them by key into centroids, and reading the centroids in the same softmax as the retained entries"></svg></div>
+      <div class="steps">
+        <div><span class="sn">1 · Evict</span><p>The gate's scores pick the top-<i class="v">K</i> per head. The rest, <i class="v">E</i>, would normally be dropped.</p></div>
+        <div><span class="sn">2 · Cluster</span><p>At the end of prefill, the evicted entries of each KV head are clustered by key into <i class="v">R</i> = 64 groups. Each group keeps its mean key <math><msub><mover accent="true"><mi>k</mi><mo>¯</mo></mover><mi>r</mi></msub></math>, mean value <math><msub><mover accent="true"><mi>v</mi><mo>¯</mo></mover><mi>r</mi></msub></math>, and its size <math><msub><mi>n</mi><mi>r</mi></msub></math>.</p></div>
+        <div><span class="sn">3 · One softmax</span><p>The <i class="v">R</i> centroids are appended to the retained cache, taking slots out of the same budget, with logit <math><mrow><mi>q</mi><mo>·</mo><msub><mover accent="true"><mi>k</mi><mo>¯</mo></mover><mi>r</mi></msub><mo>/</mo><msqrt><mi>d</mi></msqrt><mo>+</mo><mi>log</mi><msub><mi>n</mi><mi>r</mi></msub></mrow></math>. The same softmax that weights the retained entries decides their share <math><mover accent="true"><mi>ρ</mi><mo>^</mo></mover></math>.</p></div>
+      </div>
+      <div class="eq two">
+        <math display="block"><mrow><msub><mi>o</mi><mtext class="tx">joint</mtext></msub><mo>=</mo><mrow><mo>(</mo><mn>1</mn><mo>−</mo><mover accent="true"><mi>ρ</mi><mo>^</mo></mover><mo>)</mo></mrow><msub><mi>o</mi><mi>S</mi></msub><mo>+</mo><mover accent="true"><mi>ρ</mi><mo>^</mo></mover><msub><mover accent="true"><mi>o</mi><mo>^</mo></mover><mi>E</mi></msub><mo>,</mo><mspace width="1.2em"/><mover accent="true"><mi>ρ</mi><mo>^</mo></mover><mo>=</mo><mfrac><msub><mover accent="true"><mi>Z</mi><mo>^</mo></mover><mi>E</mi></msub><mrow><msub><mi>Z</mi><mi>S</mi></msub><mo>+</mo><msub><mover accent="true"><mi>Z</mi><mo>^</mo></mover><mi>E</mi></msub></mrow></mfrac></mrow></math>
+        <math display="block"><mrow><msub><mover accent="true"><mi>Z</mi><mo>^</mo></mover><mi>E</mi></msub><mo>=</mo><munder><mo>∑</mo><mi>r</mi></munder><mi>exp</mi><mo>(</mo><mfrac><mrow><mi>q</mi><mo>·</mo><msub><mover accent="true"><mi>k</mi><mo>¯</mo></mover><mi>r</mi></msub></mrow><msqrt><mi>d</mi></msqrt></mfrac><mo>+</mo><mi>log</mi><msub><mi>n</mi><mi>r</mi></msub><mo>)</mo></mrow></math>
+      </div>
+      <figcaption>The centroid values supply the missing direction <math><msub><mover accent="true"><mi>o</mi><mo>^</mo></mover><mi>E</mi></msub></math>; their logits and the cluster-size correction supply the missing mass. No parameters are trained. A query unrelated to the evicted content gives the centroids almost no mass; a query that matches it takes mass from the retained entries, instead of adding an independently scaled residual.</figcaption>
+    </figure>
+    <div class="tiles">
+      <div class="tile"><span class="lab">Memory read outside the softmax</span><span class="big">−0.09 to 0.44</span></div>
+      <div class="tile c"><span class="lab">Centroids inside the same softmax</span><span class="big">0.85 to 0.96</span></div>
+    </div>
+    <p class="cap">Cosine similarity between each method's estimate of <i class="v">o<sub>E</sub></i> and the exact <i class="v">o<sub>E</sub></i>, layer by layer (for the centroids, at most layers). It measures the direction only; the share <i class="v">ρ</i> is not part of it, and for the centroids it comes from the softmax itself. Linear-state and TTT-style memories barely improve when made larger. Downstream, Qwen3-0.6B on Math500 with 512 entries per head goes from 48.00 to 52.00 with 64 centroid slots taken out of the same budget.</p>
+  </div>
+</section>
+
+<!-- 4 -->
+<section class="col" id="results">
+  <div class="sec-head">
+    <div class="qtag"><span class="q">4</span><span class="eyebrow">Results</span></div>
+    <h2>Compared under the same budget</h2>
+  </div>
+  <div class="prose">
+    <p>Qwen3-4B and Qwen3-8B with the backbone frozen. Only the gate is trained, on long documents from LongMino with an 8K→16K curriculum. Every method gets the same average per-head budget, and that budget includes the sinks, the local window and any centroid slots.</p>
+  </div>
+  <figure class="fig">
+    <h3>RULER 8K task by task, Qwen3-8B, 75% of KV evicted</h3>
+    <div class="tbl-wrap heat-wrap"><table class="heat" id="heat"></table></div>
+    <figcaption>Darker cells score higher. S = single needle, MK = multi-key, MV = multi-value, MQ = multi-query, VT = variable tracking, CWE/FWE = common/frequent word extraction, QA = question answering.</figcaption>
+  </figure>
+
+  <div class="callout">
+    <div class="n num">73.00</div>
+    <p><strong>RULER MultiKey-3 at 75% eviction.</strong> Every other method scores below 5 (TrimKV 4.40, KVpop 2.00). At 8K the task holds 125 distractor records with the same key–value template, and the cache is compressed before the question arrives, so no record can be ruled out in advance.</p>
+  </div>
+
+  <div class="tbl-wrap">
+    <table>
+      <thead>
+        <tr class="grp"><th></th><th colspan="2">Qwen3-4B 8K</th><th colspan="2">Qwen3-4B 16K</th><th colspan="2">Qwen3-8B 8K</th><th colspan="2">Qwen3-8B 16K</th></tr>
+        <tr><th>Method</th><th>50%</th><th>75%</th><th>50%</th><th>75%</th><th>50%</th><th>75%</th><th>50%</th><th>75%</th></tr>
+      </thead>
+      <tbody>
+        <tr class="fullkv"><td>Full-KV</td><td>92.41</td><td>92.41</td><td>91.64</td><td>91.64</td><td>93.86</td><td>93.86</td><td>92.96</td><td>92.96</td></tr>
+        <tr><td>SnapKV</td><td>54.24</td><td>30.85</td><td>61.61</td><td>35.80</td><td>54.32</td><td>35.13</td><td>62.74</td><td>41.54</td></tr>
+        <tr><td>KeyDiff</td><td>73.72</td><td>62.31</td><td>70.00</td><td>61.99</td><td>77.35</td><td>67.14</td><td>74.44</td><td>66.87</td></tr>
+        <tr><td>DMA</td><td>68.18</td><td>36.34</td><td>64.69</td><td>33.30</td><td>75.22</td><td>41.76</td><td>71.78</td><td>36.19</td></tr>
+        <tr><td>TrimKV</td><td>86.38</td><td>75.42</td><td>86.40</td><td>76.29</td><td>87.23</td><td>80.26</td><td>85.91</td><td>79.09</td></tr>
+        <tr><td>KVpop</td><td>—</td><td>—</td><td>—</td><td>—</td><td>88.03</td><td>72.71</td><td>85.49</td><td>71.81</td></tr>
+        <tr class="ours"><td>IndexMem++</td><td>91.75</td><td>83.89</td><td>89.18</td><td>76.56</td><td>93.79</td><td>90.14</td><td>90.87</td><td>80.93</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="cap">RULER average over 13 tasks. Column headers give the share of KV evicted. No public Qwen3-4B checkpoint of KVpop.</p>
+
+  <h3 style="margin-top:18px">Long reasoning: accuracy without longer chains of thought</h3>
+  <div class="prose">
+    <p>In long reasoning the cache fills during generation. IndexMem++ keeps its output length close to Full-KV, while every other method generates more at the same budget. On Math500 with 1,024 entries, Random Attention and TriAttention score higher (0.869 and 0.863) and generate 40% and 64% more tokens.</p>
+  </div>
+  <div class="tbl-wrap">
+    <table>
+      <thead>
+        <tr class="grp"><th></th><th colspan="2">Math500</th><th colspan="2">AIME25</th></tr>
+        <tr><th>Method</th><th>K = 1,024</th><th>K = 512</th><th>K = 2,048</th><th>K = 1,024</th></tr>
+      </thead>
+      <tbody>
+        <tr class="fullkv"><td>Full-KV</td><td colspan="2" style="text-align:center">0.832 <span class="len">5,258 tok</span></td><td colspan="2" style="text-align:center">0.700 <span class="len">17,845 tok</span></td></tr>
+        <tr><td>KVzap</td><td>0.792† <span class="len">6,326</span></td><td>0.548† <span class="len">9,850</span></td><td>0.446 <span class="len">22,019</span></td><td>0.183 <span class="len">29,013</span></td></tr>
+        <tr><td>Fast-KVzip</td><td>0.736† <span class="len">6,974</span></td><td>0.480† <span class="len">11,146</span></td><td>0.375 <span class="len">23,904</span></td><td>0.154 <span class="len">29,462</span></td></tr>
+        <tr><td>R-KV</td><td>0.811 <span class="len">9,741</span></td><td>0.605 <span class="len">12,757</span></td><td>0.229 <span class="len">27,044</span></td><td>0.121 <span class="len">29,625</span></td></tr>
+        <tr><td>TriAttention</td><td>0.863 <span class="len">8,563</span></td><td>0.758 <span class="len">12,056</span></td><td>0.383 <span class="len">23,109</span></td><td>0.192 <span class="len">28,507</span></td></tr>
+        <tr><td>Random Attention</td><td>0.869 <span class="len">7,342</span></td><td>0.784 <span class="len">9,714</span></td><td>0.388 <span class="len">23,199</span></td><td>0.221 <span class="len">27,538</span></td></tr>
+        <tr class="ours"><td>IndexMem++</td><td>0.824 <span class="len">5,226</span></td><td>0.794 <span class="len">5,423</span></td><td>0.600 <span class="len">18,180</span></td><td>0.450 <span class="len">20,279</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="cap">Qwen3-8B, pass@1 with mean generated tokens below. K is the cache budget per KV head. Math500 uses two samples per problem, AIME25 I+II eight. † 125-problem subset of Math500. Run settings per method are in Appendix I of the paper.</p>
+
+  <div class="prose" style="margin-top:6px">
+    <p><strong>LongBench.</strong> Over 15 tasks, IndexMem++ averages 47.53 at 50% eviction (Full-KV 47.39) and 46.03 at 75%.</p>
+  </div>
+
+  <h3 style="margin-top:18px">Capacity was not the bottleneck</h3>
+  <div class="duo">
+    <div class="card">
+      <h3>A scorer that re-reads the past</h3>
+      <p>A causal convolution, a recurrent state or prefix attention over the history grows the scorer from 7.5M to as much as 24.1M parameters. All three land within 1.2 points of the plain MLP; the hidden state already carries its context.</p>
+      <span class="stat">66.82 · 68.76 · 66.63 <span style="color:var(--muted)">vs</span> 67.60</span>
+    </div>
+    <div class="card">
+      <h3>Unfreezing the backbone</h3>
+      <p>Training the backbone with the gate improves the model itself: its Full-KV score goes from 70.01 to 71.65. Eviction gets worse, because the changed representations decalibrate the scorer.</p>
+      <span class="stat">evict 75%: 67.60 → 62.83</span>
+    </div>
+  </div>
+  <p class="cap">Qwen3-0.6B pilot, RULER 8K average, 75% of KV evicted.</p>
+</section>
+
+<!-- 5 -->
+<section class="col" id="keeps">
+  <div class="sec-head">
+    <div class="qtag"><span class="q">5</span><span class="eyebrow">What the trained gate keeps</span></div>
+    <h2>Not a sliding window: early facts stay cached until they are used</h2>
+  </div>
+  <div class="prose">
+    <p>Does the gate retain early context, or does it reduce to a sliding window? The control is a recency policy that keeps the most recent entries under the same per-head budgets and centroid slots. Both run with physical eviction on Qwen3-8B at <i class="v">K</i> = 2,048, on long AIME25 reasoning traces and on software-engineering agent trajectories (SWE), fed token by token up to 8K.</p>
+  </div>
+  <figure class="fig">
+    <div class="scrollx"><svg class="diagram" id="keepSvg" viewBox="0 0 800 230" role="img" aria-label="Two cache snapshots over one 8K trajectory: the recency policy keeps only the sinks and the latest window; IndexMem++ keeps entries spread across the context, including issue-description facts that are applied later"></svg></div>
+    <div class="kp">
+      <div><span class="kv">52.5% <small>· 48.4%</small></span><span class="kl">of retained entries outside sinks and window fall inside a recency window of the same size (AIME25 · SWE). Recency: 100%.</span></div>
+      <div><span class="kv">39 / 39</span><span class="kl">issue-description facts applied later (17 of 25 SWE trajectories) still cached at the point of use. Recency has dropped the original entries of 37.</span></div>
+      <div><span class="kv">0.207 <small>vs 0.279</small></span><span class="kl">NLL of the 256 assistant tokens after an 8K prefix, AIME25; SWE 1.221 vs 1.551. Lower on every trace. Full-KV: 0.197, 1.068.</span></div>
+      <div><span class="kv">0.592 <small>vs 0.121</small></span><span class="kl">AIME25 pass@1 in free generation, IndexMem++ vs recency. Full-KV 0.654.</span></div>
+    </div>
+    <figcaption>Schematic of one SWE trajectory at 8K, one KV head: each cell is a position in the context, filled if its entry is still in the cache. Both policies keep the sinks and the local window; the recency policy keeps nothing else. Facts stated in the issue description are marked where the agent applies them later.</figcaption>
+  </figure>
+  <div class="duo">
+    <div class="card">
+      <h3>Across layers</h3>
+      <p>Adjacent layers retain similar positions, weighted Jaccard 0.512, and layers eight or more apart less so, 0.413; a random selection matched for each head's capacity and age profile gives 0.513 for adjacent layers. Taking the union over all 36 layers, an original entry survives somewhere for 99.9% of the selectable positions.</p>
+    </div>
+    <div class="card">
+      <h3>Across heads</h3>
+      <p>Within a layer, two heads' retained sets overlap with Jaccard 0.372, against 0.212 for the matched random selection. In 8K snapshots the two heads with the largest budgets hold 50.2% of a layer's selectable capacity, where a uniform split would give 25%.</p>
+    </div>
+  </div>
+  <p class="cap">Retention is not specific to facts that are applied later: early facts with no observed later use are also kept, 111 of 111 at 4K and 109 of 111 at 8K. Full setup in Appendix J of the paper.</p>
+</section>
+
+<!-- 6 -->
+<section class="col" id="summary">
+  <div class="sec-head">
+    <div class="qtag"><span class="q">6</span><span class="eyebrow">Summary</span></div>
+    <h2>Not a capacity problem. An objective problem.</h2>
+  </div>
+  <div class="prose">
+    <p>Can a gate that learns only from the model's output, and never sees the next question, learn what to evict? Yes, once "keep everything" is no longer a solution the objective can reach.</p>
+  </div>
+  <div class="facts">
+    <div><b></b><span>A small MLP gate that reads only the hidden state, attached to a frozen Qwen3-8B.</span></div>
+    <div><b></b><span>75% of the cache evicted, 3.72 RULER points lost.</span></div>
+    <div><b></b><span>Decode throughput stops tracking the context: 48.38 tokens/s at an 8K input, 46.51 at 256K (one H20, batch 1, 2,048 entries per KV head).</span></div>
+    <div><b></b><span>Inference uses no gate, only the scores, to pick the top-<i class="v">K</i>; the head budgets and centroids are built once at the end of prefill. Without compression the model is unchanged.</span></div>
+  </div>
+  <div class="linkrows">
+    <div><span>Paper</span><a href="https://arxiv.org/abs/2611.07605">arxiv.org/abs/2611.07605</a></div>
+    <div><span>Code</span><a href="https://github.com/Chooovy/IndexMem">github.com/Chooovy/IndexMem</a></div>
+    <div><span>Gates</span><a href="https://huggingface.co/collections/marcusguhao/indexmem-6a8306e81cb4455d3c35ca04">huggingface.co/collections/marcusguhao/indexmem</a></div>
+  </div>
+</section>
+
+<!-- cite -->
+<section class="col" id="bibtex">
+  <div class="sec-head">
+    <div class="eyebrow">Citation</div>
+    <h2>BibTeX</h2>
+  </div>
+<pre class="bib" id="bib">@misc{gu2026gating,
+  title         = {The Gating Mechanism of KV Cache Eviction},
+  author        = {Gu, Hao and Yang, Xintong and Li, Zhiwei and Zhu, Lei and
+                   Yang, Jian and Zhu, Qiyuan and Li, Dezhi and Zhang, Jingyuan and
+                   Kou, Zhizhuo and Wang, Hao and Liu, Bei and Liu, Jiacheng and
+                   Han, Sirui},
+  year          = {2026},
+  eprint        = {2611.07605},
+  archivePrefix = {arXiv},
+  doi           = {10.48550/arXiv.2611.07605},
+  url           = {https://arxiv.org/abs/2611.07605}
+}</pre>
+  <button type="button" class="copy" id="copyBib">Copy BibTeX</button>
+</section>
+
+<footer class="col">
+  <span>Numbers on this page are taken from the paper's tables. Qwen3 models with frozen backbones.</span>
+  <span>IndexMem++ builds on <a href="https://arxiv.org/abs/2605.25475">IndexMem</a> (Yang et al., 2026).</span>
+</footer>
+
+<script>
+(function(){
+  const tip = document.getElementById('tip');
+  function moveTip(e){
+    const x = (e.clientX ?? 0) + 14, y = (e.clientY ?? 0) + 14;
+    tip.style.left = Math.min(x, window.innerWidth - tip.offsetWidth - 8) + 'px';
+    tip.style.top = Math.min(y, window.innerHeight - tip.offsetHeight - 8) + 'px';
+  }
+  function bindTip(el, html){
+    el.addEventListener('pointerenter', e => { tip.innerHTML = html(); tip.classList.add('on'); moveTip(e); });
+    el.addEventListener('pointermove', moveTip);
+    el.addEventListener('pointerleave', () => tip.classList.remove('on'));
+  }
+
+  /* ---------- demo ---------- */
+  const Lg = [3.0,0.2,0.5,0.1,0.9,2.2,0.3,0.0,0.6,1.8,0.2,0.4,2.6,0.1,0.5,0.3,1.2,1.0,1.4,1.6];
+  const N = Lg.length, DS = 1, DW = 4;
+  const isProt = j => j < DS || j >= N - DW;
+  const dense = (() => { const e = Lg.map(Math.exp); const z = e.reduce((a,b)=>a+b,0); return e.map(x => x / z); })();
+  const st = { mode:'const', c:1.5, pin:false, fix:false, beta:2 };
+  const plot = document.getElementById('plot'), roles = document.getElementById('roles'), scoresEl = document.getElementById('scores');
+  const cols = [], scoreCells = [];
+  let cur = null;
+  for (let j = 0; j < N; j++){
+    const c = document.createElement('div'); c.className = 'colm';
+    c.innerHTML = '<div class="dense"></div><div class="gated"></div>';
+    plot.appendChild(c); cols.push(c);
+    roles.appendChild(document.createElement('div'));
+    const s = document.createElement('div'); scoresEl.appendChild(s); scoreCells.push(s);
+    bindTip(c, () => {
+      if (!cur) return '';
+      const role = isProt(j) ? (j < DS ? 'attention sink' : 'local window') : 'evictable';
+      return `<b>Entry ${j+1}</b> · ${role}<br>dense ${(dense[j]*100).toFixed(1)}% · gated ${(cur.q[j]*100).toFixed(1)}%<br>gate g = ${cur.g[j].toFixed(2)}`;
+    });
+  }
+  function evictSet(pin){ const E = []; for (let j = 0; j < N; j++) if (!(pin && isProt(j))) E.push(j); return E; }
+  function gatesFrom(s, pin, fix, beta){
+    const E = evictSet(pin), g = new Array(N).fill(1), pi = new Array(N).fill(0);
+    if (fix){ let m = -1e9; E.forEach(j => m = Math.max(m, s[j])); let Z = 0; E.forEach(j => Z += Math.exp(s[j]-m)); E.forEach(j => { pi[j] = Math.exp(s[j]-m)/Z; g[j] = beta*pi[j]; }); }
+    else E.forEach(j => g[j] = Math.exp(s[j]));
+    return { g, E, pi };
+  }
+  function forward(s, pin, fix, beta){
+    const { g, E, pi } = gatesFrom(s, pin, fix, beta);
+    const w = dense.map((p, j) => p * g[j]); const Z = w.reduce((a,b)=>a+b,0); const q = w.map(x => x / Z);
+    const kl = dense.reduce((a, p, j) => a + p * Math.log(p / q[j]), 0);
+    return { q, g, E, pi, kl };
+  }
+  function train(pin, fix, beta){
+    let seed = 7; const rnd = () => { seed = (seed * 16807) % 2147483647; return seed / 2147483647 - 0.5; };
+    const s = Lg.map(() => 0.6 * rnd());
+    for (let it = 0; it < 600; it++){
+      const { q, E, pi } = forward(s, pin, fix, beta);
+      let PE = 0, QE = 0; E.forEach(j => { PE += dense[j]; QE += q[j]; });
+      E.forEach(m => { const gr = fix ? (-dense[m] + pi[m]*PE + q[m] - pi[m]*QE) : (-dense[m] + q[m]); s[m] -= 8 * gr; });
+    }
+    return s;
+  }
+  const TOP = 0.42;
+  function render(){
+    const s = st.mode === 'const' ? new Array(N).fill(st.c) : train(st.pin, st.fix, st.beta);
+    cur = forward(s, st.pin, st.fix, st.beta);
+    const E = cur.E, se = E.map(j => s[j]);
+    const spread = Math.max(...se) - Math.min(...se);
+    const gmax = Math.max(...E.map(j => cur.g[j]), 1e-9);
+    for (let j = 0; j < N; j++){
+      const prot = st.pin && isProt(j);
+      cols[j].classList.toggle('pin', prot);
+      roles.children[j].classList.toggle('pin', isProt(j));
+      cols[j].querySelector('.dense').style.height = Math.min(100, dense[j] / TOP * 100) + '%';
+      const h = cur.q[j] / TOP * 100; cols[j].querySelector('.gated').style.height = Math.min(100, h) + '%';
+      cols[j].classList.toggle('capped', h > 100);
+      const cell = scoreCells[j];
+      if (prot){ cell.className = 'na'; cell.style.opacity = 1; }
+      else { cell.className = ''; cell.style.opacity = (0.12 + 0.88 * Math.min(1, cur.g[j] / gmax)).toFixed(3); }
+    }
+    document.getElementById('rKL').textContent = Math.max(0, cur.kl).toFixed(3);
+    document.getElementById('rSpread').textContent = (st.mode === 'const' ? 0 : spread).toFixed(2);
+    const both = st.pin && st.fix;
+    document.getElementById('rReach').textContent = both ? (st.beta >= E.length ? 'Yes, β = |E|' : 'No') : (st.pin ? 'Yes, at c = 0' : 'Yes, at any c');
+    const v = document.getElementById('verdict'); let msg, ok = false;
+    const noop = Math.abs(cur.kl) < 1e-4;
+    if (st.mode === 'const'){
+      if (noop) msg = 'No-op. Gated attention is exactly dense attention, and the scores rank nothing.';
+      else if (!both) msg = 'Gated attention differs from dense here, but c = 0 restores it. Training will find that.';
+      else { msg = 'Constant scores can no longer give dense attention. The loss now has a gradient that rewards ranking the entries.'; ok = true; }
+    } else {
+      if (noop) msg = 'Training converged to flat scores. The gate reproduces dense attention and ranks nothing.';
+      else { msg = 'Training spread the scores out. Entries compete for β, so the gate has to rank them.'; ok = true; }
+    }
+    v.textContent = msg; v.classList.toggle('ok', ok);
+  }
+  const mC = document.getElementById('mConst'), mT = document.getElementById('mTrain');
+  const cIn = document.getElementById('cIn'), cOut = document.getElementById('cOut'), cWrap = document.getElementById('cWrap');
+  const bIn = document.getElementById('bIn'), bOut = document.getElementById('bOut'), bWrap = document.getElementById('bWrap');
+  function setMode(m){ st.mode = m; mC.setAttribute('aria-pressed', m === 'const'); mT.setAttribute('aria-pressed', m === 'train'); cWrap.classList.toggle('off', m !== 'const'); cIn.disabled = m !== 'const'; render(); }
+  mC.addEventListener('click', () => setMode('const'));
+  mT.addEventListener('click', () => setMode('train'));
+  cIn.addEventListener('input', () => { st.c = +cIn.value; cOut.textContent = (st.c > 0 ? '+' : '') + st.c.toFixed(1); render(); });
+  document.getElementById('tPin').addEventListener('change', e => { st.pin = e.target.checked; render(); });
+  document.getElementById('tFix').addEventListener('change', e => { st.fix = e.target.checked; bIn.disabled = !st.fix; bWrap.classList.toggle('off', !st.fix); render(); });
+  bIn.addEventListener('input', () => { st.beta = +bIn.value; bOut.textContent = st.beta; render(); });
+  render();
+
+  /* ---------- bar charts ---------- */
+  function bars(el, rows, { max, ref, fmt = v => v.toFixed(2), unit = '' }){
+    rows.forEach(r => {
+      const row = document.createElement('div'); row.className = 'brow' + (r.hi ? ' hi' : '');
+      const pct = Math.max(0, Math.min(100, r.v / max * 100));
+      row.innerHTML = `<div class="bl">${r.label}${r.sub ? `<small>${r.sub}</small>` : ''}</div>
+        <div class="track"><div class="fill" style="width:${pct}%"></div>${ref != null ? `<div class="refline" style="left:${ref / max * 100}%"></div>` : ''}</div>
+        <div class="bv">${fmt(r.v)}${r.d ? `<span class="delta">${r.d}</span>` : ''}</div>`;
+      el.appendChild(row);
+      bindTip(row.querySelector('.track'), () => `<b>${r.label}</b><br>${fmt(r.v)}${unit}`);
+    });
+  }
+  bars(document.getElementById('stairs1'), [
+    { label:'Direct instantiation', sub:'LM loss, nothing pinned', v:4.33 },
+    { label:'+ pinned sinks and window, fixed β', v:44.86, d:'+40.53' },
+    { label:'+ KL distillation from Full-KV', v:58.86, d:'+14.00', hi:true }
+  ], { max:75, ref:70.01, unit:' RULER 8K avg.' });
+  bars(document.getElementById('pinChart'), [
+    { label:'Nothing pinned', sub:'normalizing alone', v:4.72 },
+    { label:'Local window pinned', v:57.81 },
+    { label:'Sinks + window pinned', v:67.60, hi:true }
+  ], { max:75, unit:' RULER 8K avg.' });
+  bars(document.getElementById('lossChart'), [
+    { label:'LM loss (CE)', v:51.50 },
+    { label:'LongCE', sub:'reweights long-context tokens', v:53.01 },
+    { label:'Forward KL to Full-KV', v:66.84 },
+    { label:'Reverse KL to Full-KV', v:67.60, hi:true }
+  ], { max:75, unit:' RULER 8K avg.' });
+  bars(document.getElementById('headsChart'), [
+    { label:'Permuted budgets', v:57.14 },
+    { label:'Uniform split', v:58.86 },
+    { label:'Offline table', v:62.33 },
+    { label:'Retained attention mass', v:67.60, hi:true }
+  ], { max:75, ref:70.01, unit:' RULER 8K avg.' });
+
+  /* ---------- head budget, online ---------- */
+  (function(){
+    const svg = document.getElementById('hbSvg'); if (!svg) return;
+    const NS = 'http://www.w3.org/2000/svg';
+    const inputs = {
+      A: [ { s:0.20, a:1.2 }, { s:0.45, a:2.0 }, { s:0.65, a:3.0 }, { s:0.88, a:4.0 } ],
+      B: [ { s:0.55, a:2.5 }, { s:0.15, a:1.0 }, { s:0.80, a:3.5 }, { s:0.40, a:1.8 } ]
+    };
+    const hs = { input:'A', K:0.25 };
+    const L = 66, R = 596, T = 16, B = 236;
+    const X = f => L + f * (R - L), Y = m => B - m * (B - T);
+    const rho = (h, f) => h.s + (1 - h.s) * (1 - Math.pow(1 - f, h.a));
+    const need = (h, r) => r <= h.s ? 0 : 1 - Math.pow(Math.max(0, 1 - (r - h.s) / (1 - h.s)), 1 / h.a);
+    function alloc(heads, K){
+      const floor = K / 4, total = heads.length * K;
+      const f = r => heads.map(h => Math.min(1, Math.max(floor, need(h, r))));
+      let lo = 0, hi = 1;
+      for (let i = 0; i < 48; i++){ const mid = (lo + hi) / 2; if (f(mid).reduce((a, b) => a + b, 0) < total) lo = mid; else hi = mid; }
+      const r = (lo + hi) / 2; return { r, f: f(r) };
+    }
+    const el = (n, a, txt) => { const e = document.createElementNS(NS, n); for (const k in a) e.setAttribute(k, a[k]); if (txt != null) e.textContent = txt; return e; };
+    function render(){
+      const heads = inputs[hs.input], K = hs.K, { r, f } = alloc(heads, K);
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      [0, .25, .5, .75, 1].forEach(m => {
+        svg.appendChild(el('line', { x1:L, x2:R, y1:Y(m), y2:Y(m), style:'stroke:var(--rule);stroke-width:1' }));
+        svg.appendChild(el('text', { x:R + 8, y:Y(m) + 4, class:'lab mono' }, m.toFixed(2)));
+      });
+      svg.appendChild(el('text', { x:L, y:B + 22, class:'lab' }, '0'));
+      svg.appendChild(el('text', { x:R, y:B + 22, 'text-anchor':'end', class:'lab' }, 'all'));
+      svg.appendChild(el('text', { x:(L + R) / 2, y:B + 22, 'text-anchor':'middle', class:'lab' }, 'evictable entries kept, in score order'));
+      svg.appendChild(el('text', { x:R + 56, y:(T + B) / 2, 'text-anchor':'middle', transform:'rotate(90 ' + (R + 56) + ' ' + ((T + B) / 2) + ')', class:'lab' }, 'retained attention mass'));
+      svg.appendChild(el('line', { x1:X(K), x2:X(K), y1:T, y2:B, style:'stroke:var(--slot-empty);stroke-width:1.5;stroke-dasharray:3 4' }));
+      svg.appendChild(el('text', { x:X(K) + 5, y:T + 11, class:'lab' }, 'uniform K'));
+      svg.appendChild(el('line', { x1:L, x2:R, y1:Y(r), y2:Y(r), style:'stroke:var(--gate);stroke-width:1.5;stroke-dasharray:6 4' }));
+      svg.appendChild(el('text', { x:R - 6, y:Y(r) - 7, 'text-anchor':'end', class:'mono', style:'font-size:12px;fill:var(--gate-ink)' }, 'target ρ* = ' + r.toFixed(2)));
+      heads.forEach((h, i) => {
+        const pts = []; for (let k = 0; k <= 60; k++){ const ff = k / 60; pts.push(X(ff).toFixed(1) + ',' + Y(rho(h, ff)).toFixed(1)); }
+        svg.appendChild(el('polyline', { points:pts.join(' '), style:'fill:none;stroke:var(--ink-2);stroke-width:1.8;stroke-linejoin:round' }));
+        svg.appendChild(el('line', { x1:L - 5, x2:L, y1:Y(h.s), y2:Y(h.s), style:'stroke:var(--ink-2);stroke-width:1.5' }));
+        svg.appendChild(el('text', { x:L - 9, y:Y(h.s) + 4, 'text-anchor':'end', class:'lab', style:'fill:var(--ink-2)' }, 'head ' + (i + 1)));
+        const fx = X(f[i]), fy = Y(rho(h, f[i]));
+        svg.appendChild(el('line', { x1:fx, x2:fx, y1:fy, y2:B, style:'stroke:var(--gate);stroke-width:1.5' }));
+        svg.appendChild(el('circle', { cx:fx, cy:fy, r:5, style:'fill:var(--gate);stroke:var(--surface);stroke-width:2' }));
+      });
+      svg.appendChild(el('line', { x1:L, x2:R, y1:B, y2:B, style:'stroke:var(--ink-2);stroke-width:1' }));
+      const bars = document.getElementById('hbBars'); bars.innerHTML = '';
+      heads.forEach((h, i) => {
+        const d = document.createElement('div');
+        d.innerHTML = '<span class="hn">head ' + (i + 1) + '</span><span class="hv">' + Math.round(f[i] * 100) + '%<small> of entries</small></span><span class="hm">mass ' + rho(h, f[i]).toFixed(2) + '</span><span class="hm" style="color:var(--muted)">uniform split: ' + rho(h, K).toFixed(2) + '</span>';
+        bars.appendChild(d);
+      });
+    }
+    const hbA = document.getElementById('hbA'), hbB = document.getElementById('hbB'), hbK = document.getElementById('hbK'), hbKOut = document.getElementById('hbKOut');
+    hbA.addEventListener('click', () => { hs.input = 'A'; hbA.setAttribute('aria-pressed', 'true'); hbB.setAttribute('aria-pressed', 'false'); render(); });
+    hbB.addEventListener('click', () => { hs.input = 'B'; hbA.setAttribute('aria-pressed', 'false'); hbB.setAttribute('aria-pressed', 'true'); render(); });
+    hbK.addEventListener('input', () => { hs.K = +hbK.value / 100; hbKOut.textContent = hbK.value + '%'; render(); });
+    render();
+  })();
+
+  /* ---------- centroid memory diagram ---------- */
+  (function(){
+    const svg = document.getElementById('cmpSvg'); if (!svg) return;
+    const NS = 'http://www.w3.org/2000/svg';
+    const el = (n, a, txt) => { const e = document.createElementNS(NS, n); for (const k in a) e.setAttribute(k, a[k]); if (txt != null) e.textContent = txt; return e; };
+    const KEPT = 'fill:var(--kept)', RET = 'fill:var(--slot)', GONE = 'fill:none;stroke:var(--slot-empty);stroke-width:1.5', CEN = 'fill:var(--centroid)';
+    svg.appendChild(el('text', { x:0, y:14, class:'ttl' }, '1 · After eviction'));
+    const roles1 = ['p','p','e','r','e','r','e','e','r','e','r','e','p','p','p'];
+    roles1.forEach((t, i) => {
+      const x = i * 15.5, st = t === 'p' ? KEPT : t === 'r' ? RET : GONE;
+      svg.appendChild(el('rect', { x:x + (t === 'e' ? 0.75 : 0), y:(t === 'e' ? 60.75 : 60), width:t === 'e' ? 10.5 : 12, height:t === 'e' ? 34.5 : 36, rx:2.5, style:st }));
+    });
+    svg.appendChild(el('rect', { x:0, y:109, width:8, height:11, rx:2, style:KEPT }));
+    svg.appendChild(el('text', { x:14, y:118, class:'lab' }, 'pinned sinks and window'));
+    svg.appendChild(el('rect', { x:0, y:125, width:8, height:11, rx:2, style:RET }));
+    svg.appendChild(el('text', { x:14, y:134, class:'lab' }, 'retained by score'));
+    svg.appendChild(el('rect', { x:0.75, y:141.75, width:6.5, height:9.5, rx:2, style:GONE }));
+    svg.appendChild(el('text', { x:14, y:150, class:'lab' }, 'evicted: the set E'));
+    svg.appendChild(el('text', { x:0, y:186, class:'lab', style:'fill:var(--ink-2)' }, 'Dropped outright, E takes its share ρ'));
+    svg.appendChild(el('text', { x:0, y:202, class:'lab', style:'fill:var(--ink-2)' }, 'of the attention mass with it.'));
+    svg.appendChild(el('path', { d:'M240 78 h18 l-5 -5 m5 5 l-5 5', style:'fill:none;stroke:var(--muted);stroke-width:1.5' }));
+    const ox = 272;
+    svg.appendChild(el('text', { x:ox, y:14, class:'ttl' }, '2 · Cluster the evicted keys'));
+    const clusters = [
+      { cx:ox + 48, cy:84, n:5, pts:[[-16,-10],[12,-14],[-6,12],[16,8],[-18,6]] },
+      { cx:ox + 150, cy:62, n:3, pts:[[-12,8],[13,-6],[2,14]] },
+      { cx:ox + 130, cy:152, n:4, pts:[[-15,-8],[14,-10],[-4,14],[16,10]] }
+    ];
+    clusters.forEach(c => {
+      svg.appendChild(el('circle', { cx:c.cx, cy:c.cy, r:28, style:'fill:none;stroke:var(--centroid);stroke-width:1;stroke-dasharray:3 3;opacity:.7' }));
+      c.pts.forEach(pt => svg.appendChild(el('circle', { cx:c.cx + pt[0], cy:c.cy + pt[1], r:4.5, style:GONE })));
+      svg.appendChild(el('circle', { cx:c.cx, cy:c.cy, r:5.5, style:CEN }));
+      svg.appendChild(el('text', { x:c.cx + 32, y:c.cy + 4, class:'lab mono', style:'fill:var(--centroid-ink)' }, 'n = ' + c.n));
+    });
+    svg.appendChild(el('text', { x:ox, y:202, class:'lab', style:'fill:var(--ink-2)' }, 'k-means on the cached keys, per KV head.'));
+    svg.appendChild(el('text', { x:ox, y:218, class:'lab', style:'fill:var(--ink-2)' }, 'Each cluster: mean key, mean value, size n.'));
+    svg.appendChild(el('path', { d:'M506 78 h18 l-5 -5 m5 5 l-5 5', style:'fill:none;stroke:var(--muted);stroke-width:1.5' }));
+    const px = 546;
+    svg.appendChild(el('text', { x:px, y:14, class:'ttl' }, '3 · Read them in one softmax'));
+    const slots = ['p','p','r','r','r','r','r','p','p','c','c','c'];
+    const share = [0.05,0.04,0.03,0.12,0.02,0.06,0.03,0.08,0.04,0.11,0.02,0.05];
+    const sum = share.reduce((a, b) => a + b, 0);
+    const qx = px + 40 + (slots.length * 17 - 4) / 2;
+    svg.appendChild(el('circle', { cx:qx, cy:44, r:9, style:'fill:var(--surface);stroke:var(--ink-2);stroke-width:1.5' }));
+    svg.appendChild(el('text', { x:qx, y:48, 'text-anchor':'middle', class:'serif', style:'font-size:12px' }, 'q'));
+    svg.appendChild(el('path', { d:'M' + qx + ' 54 v56 m-4 -5 l4 5 l4 -5', style:'fill:none;stroke:var(--muted);stroke-width:1.5' }));
+    slots.forEach((t, i) => {
+      const x = px + 40 + i * 17, h = share[i] / sum * 130;
+      const st = t === 'p' ? KEPT : t === 'r' ? RET : CEN;
+      svg.appendChild(el('rect', { x, y:150 - h, width:13, height:h, rx:2, style:st + (t === 'c' ? '' : ';opacity:.85') }));
+      svg.appendChild(el('rect', { x, y:160, width:13, height:22, rx:2.5, style:st }));
+    });
+    svg.appendChild(el('line', { x1:px + 40, x2:px + 40 + slots.length * 17 - 4, y1:150, y2:150, style:'stroke:var(--ink-2);stroke-width:1' }));
+    const c0 = px + 40 + 9 * 17, c1 = px + 40 + 12 * 17 - 4;
+    svg.appendChild(el('path', { d:'M' + c0 + ' 190 v6 h' + (c1 - c0) + ' v-6', style:'fill:none;stroke:var(--centroid);stroke-width:1.5' }));
+    svg.appendChild(el('text', { x:(c0 + c1) / 2, y:212, 'text-anchor':'middle', class:'lab mono', style:'fill:var(--centroid-ink)' }, 'R centroids'));
+    svg.appendChild(el('text', { x:(c0 + c1) / 2, y:228, 'text-anchor':'middle', class:'lab', style:'fill:var(--centroid-ink)' }, 'their share'));
+    svg.appendChild(el('text', { x:px + 40, y:212, class:'lab' }, 'retained cache'));
+    svg.appendChild(el('text', { x:px + 40, y:248, class:'lab', style:'fill:var(--ink-2)' }, 'one softmax over retained ∪ centroids'));
+  })();
+
+  /* ---------- what the gate keeps ---------- */
+  (function(){
+    const svg = document.getElementById('keepSvg'); if (!svg) return;
+    const NS = 'http://www.w3.org/2000/svg';
+    const el = (n, a, txt) => { const e = document.createElementNS(NS, n); for (const k in a) e.setAttribute(k, a[k]); if (txt != null) e.textContent = txt; return e; };
+    const KEPT = 'fill:var(--kept)', RET = 'fill:var(--slot)', GONE = 'fill:none;stroke:var(--slot-empty);stroke-width:1.2', FACT = 'fill:var(--gate)';
+    const N = 64, SINK = 2, WIN = 8, L = 152, W = 8.6, G = 1.4, ISSUE = 12;
+    // deterministic scattered retention for the IndexMem++ row
+    let seed = 11; const rnd = () => { seed = (seed * 16807) % 2147483647; return seed / 2147483647; };
+    const facts = [3, 6, 9];
+    const uses = [[3, 44], [6, 51], [9, 58]];
+    const kept = [];
+    for (let i = 0; i < N; i++){
+      if (i < SINK || i >= N - WIN) { kept.push('p'); continue; }
+      const t = i / N;
+      const pr = i < ISSUE ? 0.55 : 0.18 + 0.35 * t;
+      kept.push(facts.includes(i) ? 'f' : (rnd() < pr ? 'r' : 'e'));
+    }
+    const rows = [
+      { y: 64, name: 'Recency policy', cells: Array.from({ length: N }, (_, i) => (i < SINK || i >= N - WIN) ? 'p' : 'e') },
+      { y: 140, name: 'IndexMem++', cells: kept }
+    ];
+    const cx = i => L + i * (W + G);
+    // top brackets
+    const b1 = [cx(0), cx(ISSUE - 1) + W], b2 = [cx(N - WIN), cx(N - 1) + W];
+    svg.appendChild(el('path', { d:`M${b1[0]} 30 v-6 h${b1[1] - b1[0]} v6`, style:'fill:none;stroke:var(--muted);stroke-width:1' }));
+    svg.appendChild(el('text', { x:(b1[0] + b1[1]) / 2, y:16, 'text-anchor':'middle', class:'lab' }, 'issue description'));
+    svg.appendChild(el('path', { d:`M${b2[0]} 30 v-6 h${b2[1] - b2[0]} v6`, style:'fill:none;stroke:var(--muted);stroke-width:1' }));
+    svg.appendChild(el('text', { x:(b2[0] + b2[1]) / 2, y:16, 'text-anchor':'middle', class:'lab' }, 'local window'));
+    svg.appendChild(el('text', { x:cx(ISSUE + 1), y:16, class:'lab' }, 'sinks ← tool calls, observations, edits … → now'));
+    rows.forEach(r => {
+      svg.appendChild(el('text', { x:L - 10, y:r.y + 20, 'text-anchor':'end', class:'ttl' }, r.name));
+      r.cells.forEach((t, i) => {
+        const x = cx(i), st = t === 'p' ? KEPT : t === 'r' ? RET : t === 'f' ? FACT : GONE;
+        const e = t === 'e';
+        svg.appendChild(el('rect', { x: x + (e ? 0.6 : 0), y: r.y + (e ? 0.6 : 0), width: W - (e ? 1.2 : 0), height: 30 - (e ? 1.2 : 0), rx:1.6, style:st }));
+      });
+    });
+    // use arrows on the IndexMem++ row
+    uses.forEach(([f, u]) => {
+      const x0 = cx(f) + W / 2, x1 = cx(u) + W / 2, y = 140 + 30;
+      svg.appendChild(el('path', { d:`M${x0} ${y + 2} C ${x0} ${y + 34}, ${x1} ${y + 34}, ${x1} ${y + 4} m-4 5 l4 -5 l4 5`, style:'fill:none;stroke:var(--gate);stroke-width:1.3' }));
+    });
+    svg.appendChild(el('text', { x:cx(44) + 40, y:212, 'text-anchor':'middle', class:'lab', style:'fill:var(--gate-ink)' }, 'facts applied later: still cached (39 of 39)'));
+    svg.appendChild(el('text', { x:L - 10, y:98, 'text-anchor':'end', class:'lab' }, 'keeps only the latest'));
+    svg.appendChild(el('text', { x:L - 10, y:174, 'text-anchor':'end', class:'lab' }, 'half of what it keeps'));
+    svg.appendChild(el('text', { x:L - 10, y:188, 'text-anchor':'end', class:'lab' }, 'is outside the window'));
+    // legend
+    const lg = [[KEPT, 'sinks + window'], [RET, 'retained by the gate'], [FACT, 'issue fact'], [GONE, 'evicted']];
+    let lx = cx(0);
+    lg.forEach(([st, name]) => {
+      svg.appendChild(el('rect', { x:lx, y:44 - 10, width:8, height:9, rx:1.5, style:st }));
+      const t = el('text', { x:lx + 12, y:44 - 2, class:'lab' }, name); svg.appendChild(t);
+      lx += 12 + name.length * 5.8 + 16;
+    });
+  })();
+
+  /* ---------- heat table ---------- */
+  (function(){
+    const tasks = ['S1','S2','S3','MK1','MK2','MK3','MV','MQ','VT','CWE','FWE','QA1','QA2'];
+    const cols = [
+      ['Full-KV',    [100,100,100,99.80,99.60,99.60,100,100,100,94.24,91.00,75.80,60.20], 93.86],
+      ['IndexMem++', [100,100,96.40,99.20,97.80,73.00,98.80,100,100,83.18,91.40,71.40,60.60], 90.14],
+      ['TrimKV',     [100,100,99.60,97.80,51.00,4.40,97.80,99.35,100,91.34,91.27,58.00,52.80], 80.26],
+      ['KVpop',      [100,94.20,83.20,79.20,37.80,2.00,89.55,89.70,100,92.06,86.93,44.20,46.40], 72.71]
+    ];
+    const bg = v => `background:color-mix(in srgb, var(--gate) ${(4 + 40 * (v / 100) ** 2).toFixed(1)}%, var(--surface))`;
+    const t = document.getElementById('heat');
+    t.innerHTML = '<thead><tr><th>Task</th>' + cols.map(c => `<th>${c[0]}</th>`).join('') + '</tr></thead>';
+    const tb = document.createElement('tbody');
+    tasks.forEach((task, i) => {
+      const tr = document.createElement('tr'); if (task === 'MK2' || task === 'MK3') tr.className = 'hot';
+      tr.innerHTML = `<td>${task}</td>` + cols.map(c => `<td style="${bg(c[1][i])}">${c[1][i].toFixed(2)}</td>`).join('');
+      tb.appendChild(tr);
+    });
+    const avg = document.createElement('tr'); avg.className = 'avg';
+    avg.innerHTML = '<td>Average</td>' + cols.map(c => `<td style="${bg(c[2])}">${c[2].toFixed(2)}</td>`).join('');
+    tb.appendChild(avg); t.appendChild(tb);
+  })();
+
+  /* ---------- copy ---------- */
+  const btn = document.getElementById('copyBib');
+  btn.addEventListener('click', () => {
+    const t = document.getElementById('bib').textContent;
+    const done = () => { btn.textContent = 'Copied'; setTimeout(() => btn.textContent = 'Copy BibTeX', 1600); };
+    const fallback = () => { const r = document.createRange(); r.selectNodeContents(document.getElementById('bib')); const s = getSelection(); s.removeAllRanges(); s.addRange(r); btn.textContent = 'Selected. Press Ctrl/⌘+C'; };
+    try { navigator.clipboard.writeText(t).then(done, fallback); } catch (e) { fallback(); }
+  });
+})();
+</script>
+</body>
+</html>
